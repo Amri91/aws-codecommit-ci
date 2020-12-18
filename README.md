@@ -13,6 +13,12 @@ aws configure # Alternatively, set AWS_PROFILE and AWS_DEFAULT_REGION
 git clone git@github.com:Amri91/aws-codecommit-ci.git && cd aws-codecommit-ci && ./deploy.sh
 ```
 
+## To remove
+
+```bash
+./remove.sh
+```
+
 ## CodeBuild custom environment variables
 
 - repositoryName
