@@ -1,0 +1,154 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Creates the reviewer build project and an event to watch the repositories.
+Parameters:
+  TrackedRepositories:
+    Type: CommaDelimitedList
+Resources:
+  EventTrigger:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::Region}-EventTrigger-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: allows-triggering-build
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - codebuild:StartBuild
+                Resource: !GetAtt 'Reviewer.Arn'
+                Effect: Allow
+  PREvents:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Detects CodeCommit PR changes
+      EventPattern:
+        source:
+          - aws.codecommit
+        resources: !Ref 'TrackedRepositories'
+        detail-type:
+          - CodeCommit Pull Request State Change
+        detail:
+          pullRequestStatus:
+            - Open
+          isMerged:
+            - 'False'
+          event:
+            - pullRequestCreated
+            - pullRequestSourceBranchUpdated
+      Targets:
+        - Id: codebuild
+          Arn: !GetAtt 'Reviewer.Arn'
+          RoleArn: !GetAtt 'EventTrigger.Arn'
+          InputTransformer:
+            InputPathsMap:
+              repositoryName: $.detail.repositoryNames[0]
+              pullRequestId: $.detail.pullRequestId
+              destinationCommit: $.detail.destinationCommit
+              sourceCommit: $.detail.sourceCommit
+              destinationReference: $.detail.destinationReference
+              sourceReference: $.detail.sourceReference
+            InputTemplate: '{"environmentVariablesOverride":[{"name":"repositoryName","value":<repositoryName>},{"name":"pullRequestId","value":<pullRequestId>},{"name":"destinationCommit","value":<destinationCommit>},{"name":"sourceCommit","value":<sourceCommit>},{"name":"destinationReference","value":<destinationReference>},{"name":"sourceReference","value":<sourceReference>}]}'
+
+  ReviewerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+      Policies:
+        - PolicyName: codebuild-base-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                  - codecommit:Get*
+                  - codecommit:List*
+                  - codecommit:GitPull
+                  - codecommit:Describe*
+                  - codecommit:PostCommentForPullRequest
+                  - codecommit:UpdatePullRequestApprovalState
+                Resource: '*'
+      Path: /
+      RoleName: !Sub "${AWS::Region}-ReviewerRole-${AWS::StackName}"
+
+  Reviewer:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Description: Code Reviewer
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: 'aws/codebuild/amazonlinux2-x86_64-standard:3.0'
+        Type: LINUX_CONTAINER
+      ServiceRole: !Ref 'ReviewerRole'
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - |
+                  set -euo pipefail
+
+                  # To enable cloning.
+                  git config --global credential.helper '!aws codecommit credential-helper $@'
+                  git config --global credential.UseHttpPath true
+
+                  # Extracts feat/myFeature from /head/ref/feat/myFeature
+                  sourceBranch=$(echo $sourceReference | cut --complement -f1,2 -d/)
+
+                  # Extracts develop from /head/ref/develop
+                  destinationBranch=$(echo $destinationReference | cut --complement -f1,2 -d/)
+
+                  echo "Cloning."
+                  git clone https://git-codecommit.$AWS_REGION.amazonaws.com/v1/repos/$repositoryName repo > /dev/null 2>&1 && cd repo
+                  git checkout $sourceCommit > /dev/null 2>&1
+
+                  echo "Running tests."
+                  # Empty array where we will push all exit codes
+                  checks=()
+
+                  # vv Add checks below vv
+
+                  test=0
+                  echo "No tests written yet." || test=$?
+                  checks+=("$test")
+
+                  # ^^ Add checks above ^^
+
+                  # This is a required identifier for approve/revoke a PR.
+                  revisionId=$(aws codecommit get-pull-request --pull-request-id $pullRequestId --query 'pullRequest.revisionId' --output text)
+
+                  echo "Reporting results."
+                  # Checks if all exit codes are 0 (successful)
+                  if [[ "${checks[*]}" =~ ^(0 )*0$ ]]; then
+                      approvedBy=$(aws codecommit get-pull-request-approval-states --pull-request-id $pullRequestId --revision-id "$revisionId" --query 'approvals[?approvalState==`APPROVE` && contains(userArn,`AWSCodeBuild`)==`true`].userArn' --output text)
+                      if [ -z "$approvedBy" ]; then
+                        aws codecommit update-pull-request-approval-state --pull-request-id $pullRequestId --revision-id "$revisionId" --approval-state "APPROVE"
+                        aws codecommit post-comment-for-pull-request --pull-request-id $pullRequestId --repository-name $repositoryName --before-commit-id $destinationCommit --after-commit-id $sourceCommit --content "LGTM!"
+                      else
+                        echo "PR already approved by $approvedBy."
+                      fi
+                  else
+                      aws codecommit update-pull-request-approval-state --pull-request-id $pullRequestId --revision-id "$revisionId" --approval-state "REVOKE"
+                      aws codecommit post-comment-for-pull-request --pull-request-id $pullRequestId --repository-name $repositoryName --before-commit-id $destinationCommit --after-commit-id $sourceCommit --content "Almost there! Check the logs here for more information: $CODEBUILD_BUILD_URL"
+                  fi
